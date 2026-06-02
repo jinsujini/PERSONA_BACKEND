@@ -58,7 +58,22 @@ async def chat(websocket: WebSocket, character_id: str):
                 await websocket.send_json({"type": "error", "content": "Invalid JSON"})
                 continue
 
+            action = data.get("action")
             user_message = data.get("message", "").strip()
+
+            if action == "reset":
+                conversation_history.clear()
+                await websocket.send_json({"type": "reset_done"})
+                continue
+
+            if action == "summarize":
+                if not conversation_history:
+                    await websocket.send_json({"type": "error", "content": "대화 내역이 없어요."})
+                    continue
+                summary = await _summarize(conversation_history, character.name)
+                await websocket.send_json({"type": "summary", "content": summary})
+                continue
+
             if not user_message:
                 await websocket.send_json({"type": "error", "content": "Empty message"})
                 continue
@@ -131,7 +146,24 @@ async def group_chat(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "content": "Invalid JSON"})
                 continue
 
+            action = data.get("action")
             user_message = data.get("message", "").strip()
+
+            if action == "reset":
+                history.clear()
+                await websocket.send_json({"type": "reset_done"})
+                continue
+
+            if action == "summarize":
+                if not history:
+                    await websocket.send_json({"type": "error", "content": "대화 내역이 없어요."})
+                    continue
+                group_history = _group_history_to_contents(history)
+                names = ", ".join(c.name for c in characters)
+                summary = await _summarize(group_history, names)
+                await websocket.send_json({"type": "summary", "content": summary})
+                continue
+
             if not user_message:
                 await websocket.send_json({"type": "error", "content": "Empty message"})
                 continue
@@ -229,3 +261,38 @@ def _build_group_history(
 
     contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
     return contents
+
+
+def _group_history_to_contents(history: list[dict]) -> list[types.Content]:
+    """그룹 채팅 히스토리를 요약용 단순 Content 목록으로 변환."""
+    contents: list[types.Content] = []
+    for round_ in history:
+        contents.append(types.Content(role="user", parts=[types.Part(text=round_["user"])]))
+        responses_text = "\n".join(
+            f"[{CHARACTERS[r['character_id']].name}]: {r['content']}"
+            for r in round_["responses"]
+        )
+        if responses_text:
+            contents.append(types.Content(role="model", parts=[types.Part(text=responses_text)]))
+    return contents
+
+
+async def _summarize(history: list[types.Content], character_names: str) -> str:
+    SUMMARIZE_PROMPT = (
+        f"다음은 사용자와 {character_names} 사이의 대화입니다. "
+        "대화 내용을 한 문장으로 간결하게 한국어로 요약해줘. "
+        "어떤 고민을 나눴는지 핵심만 담아줘. 줄바꿈 없이 한 줄로만 출력해."
+    )
+    try:
+        response = await client.aio.models.generate_content(
+            model=MODEL,
+            contents=history,
+            config=types.GenerateContentConfig(
+                system_instruction=SUMMARIZE_PROMPT,
+                max_output_tokens=512,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        return response.text
+    except Exception as e:
+        return f"요약 중 오류가 발생했어요: {e}"
