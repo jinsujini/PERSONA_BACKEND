@@ -1,7 +1,7 @@
 import json
 import os
 
-import anthropic
+import google.generativeai as genai
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,23 +14,20 @@ app = FastAPI(title="Persona Chat API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 개발 중에는 전체 허용, 배포 시 프론트엔드 도메인으로 변경
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-MAX_HISTORY = 20  # 최근 N개 메시지만 컨텍스트로 유지
+MAX_HISTORY = 20
 
 
 @app.get("/characters")
 def get_characters():
-    return [
-        {"id": char.id, "name": char.name}
-        for char in CHARACTERS.values()
-    ]
+    return [{"id": char.id, "name": char.name} for char in CHARACTERS.values()]
 
 
 @app.websocket("/ws/chat/{character_id}")
@@ -46,6 +43,12 @@ async def chat(websocket: WebSocket, character_id: str):
         await websocket.close()
         return
 
+    model = genai.GenerativeModel(
+        model_name="gemini-2.0-flash",
+        system_instruction=character.system_prompt,
+    )
+
+    # Gemini 대화 이력 형식: role은 "user" 또는 "model"
     conversation_history: list[dict] = []
 
     try:
@@ -63,25 +66,22 @@ async def chat(websocket: WebSocket, character_id: str):
                 await websocket.send_json({"type": "error", "content": "Empty message"})
                 continue
 
-            conversation_history.append({"role": "user", "content": user_message})
-
-            # 컨텍스트 창 관리: 최근 MAX_HISTORY개 메시지만 유지
+            conversation_history.append({"role": "user", "parts": [user_message]})
             trimmed_history = conversation_history[-MAX_HISTORY:]
 
             full_response = ""
 
-            with client.messages.stream(
-                model="claude-sonnet-4-6",
-                max_tokens=1024,
-                system=character.system_prompt,
-                messages=trimmed_history,
-            ) as stream:
-                for text_chunk in stream.text_stream:
-                    full_response += text_chunk
-                    await websocket.send_json({"type": "chunk", "content": text_chunk})
+            response = await model.generate_content_async(
+                trimmed_history,
+                stream=True,
+            )
 
-            conversation_history.append({"role": "assistant", "content": full_response})
+            async for chunk in response:
+                if chunk.text:
+                    full_response += chunk.text
+                    await websocket.send_json({"type": "chunk", "content": chunk.text})
 
+            conversation_history.append({"role": "model", "parts": [full_response]})
             await websocket.send_json({"type": "done"})
 
     except WebSocketDisconnect:
