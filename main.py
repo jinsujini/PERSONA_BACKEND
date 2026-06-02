@@ -4,8 +4,7 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
 
 from characters import CHARACTERS
 
@@ -21,7 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
 
 MAX_HISTORY = 20
 
@@ -44,7 +43,7 @@ async def chat(websocket: WebSocket, character_id: str):
         await websocket.close()
         return
 
-    conversation_history: list[types.Content] = []
+    conversation_history: list[dict] = []
 
     try:
         while True:
@@ -61,28 +60,28 @@ async def chat(websocket: WebSocket, character_id: str):
                 await websocket.send_json({"type": "error", "content": "Empty message"})
                 continue
 
-            conversation_history.append(
-                types.Content(role="user", parts=[types.Part.from_text(text=user_message)])
-            )
+            conversation_history.append({"role": "user", "content": user_message})
             trimmed_history = conversation_history[-MAX_HISTORY:]
 
             full_response = ""
 
-            async for chunk in client.aio.models.generate_content_stream(
-                model="gemini-2.0-flash",
-                contents=trimmed_history,
-                config=types.GenerateContentConfig(
-                    system_instruction=character.system_prompt,
-                    max_output_tokens=1024,
-                ),
-            ):
-                if chunk.text:
-                    full_response += chunk.text
-                    await websocket.send_json({"type": "chunk", "content": chunk.text})
-
-            conversation_history.append(
-                types.Content(role="model", parts=[types.Part.from_text(text=full_response)])
+            stream = await client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": character.system_prompt},
+                    *trimmed_history,
+                ],
+                stream=True,
+                max_tokens=1024,
             )
+
+            async for chunk in stream:
+                content = chunk.choices[0].delta.content
+                if content:
+                    full_response += content
+                    await websocket.send_json({"type": "chunk", "content": content})
+
+            conversation_history.append({"role": "assistant", "content": full_response})
             await websocket.send_json({"type": "done"})
 
     except WebSocketDisconnect:
