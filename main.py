@@ -1,11 +1,16 @@
+import asyncio
 import json
 import os
+
+import logging
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
+
+logger = logging.getLogger("persona")
 
 from characters import CHARACTERS
 
@@ -27,6 +32,10 @@ MAX_HISTORY = 20
 MODEL = "gemini-2.5-flash"
 GENERATE_CONFIG = dict(max_output_tokens=1024, thinking_config=types.ThinkingConfig(thinking_budget=0))
 
+# session_id → 라운드 목록
+# 라운드: {"user": str, "responses": [{"character_id": str, "content": str}]}
+sessions: dict[str, list[dict]] = {}
+
 
 @app.get("/characters")
 def get_characters():
@@ -34,7 +43,7 @@ def get_characters():
 
 
 @app.websocket("/ws/chat/{character_id}")
-async def chat(websocket: WebSocket, character_id: str):
+async def chat(websocket: WebSocket, character_id: str, session_id: str = ""):
     await websocket.accept()
 
     character = CHARACTERS.get(character_id)
@@ -46,7 +55,8 @@ async def chat(websocket: WebSocket, character_id: str):
         await websocket.close()
         return
 
-    conversation_history: list[types.Content] = []
+    history = sessions.setdefault(session_id, []) if session_id else []
+    logger.info("[chat/%s] connected session=%s history=%d", character_id, session_id or "none", len(history))
 
     try:
         while True:
@@ -60,17 +70,19 @@ async def chat(websocket: WebSocket, character_id: str):
 
             action = data.get("action")
             user_message = data.get("message", "").strip()
+            logger.info("[chat/%s] action=%s message=%s", character_id, action, user_message[:30] if user_message else "")
 
             if action == "reset":
-                conversation_history.clear()
+                history.clear()
                 await websocket.send_json({"type": "reset_done"})
                 continue
 
             if action == "summarize":
-                if not conversation_history:
+                if not history:
                     await websocket.send_json({"type": "error", "content": "대화 내역이 없어요."})
                     continue
-                summary = await _summarize(conversation_history, character.name)
+                contents = _history_to_contents(history)
+                summary = await _summarize(contents, character.name)
                 await websocket.send_json({"type": "summary", "content": summary})
                 continue
 
@@ -78,44 +90,50 @@ async def chat(websocket: WebSocket, character_id: str):
                 await websocket.send_json({"type": "error", "content": "Empty message"})
                 continue
 
-            conversation_history.append(
-                types.Content(role="user", parts=[types.Part(text=user_message)])
-            )
-            trimmed_history = conversation_history[-MAX_HISTORY:]
+            current_round: dict = {"user": user_message, "responses": []}
+            contents = _build_history(history, current_round, character.id)
             full_response = ""
 
             try:
-                async for chunk in await client.aio.models.generate_content_stream(
-                    model=MODEL,
-                    contents=trimmed_history,
-                    config=types.GenerateContentConfig(
-                        system_instruction=character.system_prompt,
-                        **GENERATE_CONFIG,
-                    ),
-                ):
-                    try:
-                        content = chunk.text
-                    except Exception:
-                        continue
-                    if content:
-                        content = content.replace("\n", " ")
-                        full_response += content
-                        await websocket.send_json({"type": "chunk", "content": content})
+                async with asyncio.timeout(25):
+                    async for chunk in await client.aio.models.generate_content_stream(
+                        model=MODEL,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=character.system_prompt,
+                            **GENERATE_CONFIG,
+                        ),
+                    ):
+                        try:
+                            content = chunk.text
+                        except Exception:
+                            continue
+                        if content:
+                            content = content.replace("\n", " ")
+                            full_response += content
+                            await websocket.send_json({"type": "chunk", "content": content})
+            except WebSocketDisconnect:
+                raise
             except Exception as e:
-                await websocket.send_json({"type": "error", "content": str(e)})
+                try:
+                    await websocket.send_json({"type": "error", "content": str(e)})
+                except WebSocketDisconnect:
+                    raise
                 continue
 
-            conversation_history.append(
-                types.Content(role="model", parts=[types.Part(text=full_response)])
-            )
+            current_round["responses"].append({"character_id": character.id, "content": full_response})
+            history.append(current_round)
+            if len(history) > MAX_HISTORY:
+                history[:] = history[-MAX_HISTORY:]
+
             await websocket.send_json({"type": "done"})
 
     except WebSocketDisconnect:
-        pass
+        logger.info("[chat/%s] disconnected session=%s", character_id, session_id or "none")
 
 
 @app.websocket("/ws/group-chat")
-async def group_chat(websocket: WebSocket):
+async def group_chat(websocket: WebSocket, session_id: str = ""):
     await websocket.accept()
 
     try:
@@ -134,7 +152,9 @@ async def group_chat(websocket: WebSocket):
         await websocket.close()
         return
 
-    history: list[dict] = []
+    history = sessions.setdefault(session_id, []) if session_id else []
+    char_names = [c.id for c in characters]
+    logger.info("[group-chat] connected session=%s characters=%s history=%d", session_id or "none", char_names, len(history))
 
     try:
         while True:
@@ -148,6 +168,7 @@ async def group_chat(websocket: WebSocket):
 
             action = data.get("action")
             user_message = data.get("message", "").strip()
+            logger.info("[group-chat] action=%s message=%s", action, user_message[:30] if user_message else "")
 
             if action == "reset":
                 history.clear()
@@ -158,9 +179,9 @@ async def group_chat(websocket: WebSocket):
                 if not history:
                     await websocket.send_json({"type": "error", "content": "대화 내역이 없어요."})
                     continue
-                group_history = _group_history_to_contents(history)
+                contents = _history_to_contents(history)
                 names = ", ".join(c.name for c in characters)
-                summary = await _summarize(group_history, names)
+                summary = await _summarize(contents, names)
                 await websocket.send_json({"type": "summary", "content": summary})
                 continue
 
@@ -171,36 +192,42 @@ async def group_chat(websocket: WebSocket):
             current_round: dict = {"user": user_message, "responses": []}
 
             for character in characters:
-                contents = _build_group_history(history, current_round, character.id)
+                contents = _build_history(history, current_round, character.id)
                 full_response = ""
 
                 try:
-                    async for chunk in await client.aio.models.generate_content_stream(
-                        model=MODEL,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=character.system_prompt,
-                            **GENERATE_CONFIG,
-                        ),
-                    ):
-                        try:
-                            content = chunk.text
-                        except Exception:
-                            continue
-                        if content:
-                            content = content.replace("\n", " ")
-                            full_response += content
-                            await websocket.send_json({
-                                "type": "chunk",
-                                "character_id": character.id,
-                                "content": content,
-                            })
+                    async with asyncio.timeout(25):
+                        async for chunk in await client.aio.models.generate_content_stream(
+                            model=MODEL,
+                            contents=contents,
+                            config=types.GenerateContentConfig(
+                                system_instruction=character.system_prompt,
+                                **GENERATE_CONFIG,
+                            ),
+                        ):
+                            try:
+                                content = chunk.text
+                            except Exception:
+                                continue
+                            if content:
+                                content = content.replace("\n", " ")
+                                full_response += content
+                                await websocket.send_json({
+                                    "type": "chunk",
+                                    "character_id": character.id,
+                                    "content": content,
+                                })
+                except WebSocketDisconnect:
+                    raise
                 except Exception as e:
-                    await websocket.send_json({
-                        "type": "error",
-                        "character_id": character.id,
-                        "content": str(e),
-                    })
+                    try:
+                        await websocket.send_json({
+                            "type": "error",
+                            "character_id": character.id,
+                            "content": str(e),
+                        })
+                    except WebSocketDisconnect:
+                        raise
                     continue
 
                 current_round["responses"].append({
@@ -214,19 +241,20 @@ async def group_chat(websocket: WebSocket):
 
             history.append(current_round)
             if len(history) > MAX_HISTORY:
-                history = history[-MAX_HISTORY:]
+                history[:] = history[-MAX_HISTORY:]
 
             await websocket.send_json({"type": "done"})
 
     except WebSocketDisconnect:
-        pass
+        logger.info("[group-chat] disconnected session=%s", session_id or "none")
 
 
-def _build_group_history(
+def _build_history(
     history: list[dict],
     current_round: dict,
     character_id: str,
 ) -> list[types.Content]:
+    """특정 캐릭터 시점으로 전체 히스토리를 Gemini Content 형식으로 변환."""
     contents: list[types.Content] = []
 
     for round_ in history:
@@ -236,7 +264,6 @@ def _build_group_history(
             None,
         )
         others = [r for r in round_["responses"] if r["character_id"] != character_id]
-
         if others:
             other_text = "\n".join(
                 f"[{CHARACTERS[r['character_id']].name}]: {r['content']}" for r in others
@@ -263,8 +290,8 @@ def _build_group_history(
     return contents
 
 
-def _group_history_to_contents(history: list[dict]) -> list[types.Content]:
-    """그룹 채팅 히스토리를 요약용 단순 Content 목록으로 변환."""
+def _history_to_contents(history: list[dict]) -> list[types.Content]:
+    """요약용 — 전체 대화를 단순 user/model 턴으로 변환."""
     contents: list[types.Content] = []
     for round_ in history:
         contents.append(types.Content(role="user", parts=[types.Part(text=round_["user"])]))
